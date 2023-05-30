@@ -5,8 +5,10 @@ mod unpack;
 
 use crate::{crate_name::CrateName, package_id_spec::PackageIdSpec};
 use anyhow::{anyhow, Context, Error};
+use cargo_metadata::MetadataCommand;
 use clap::{CommandFactory, FromArgMatches, Parser};
 use std::{io::Read, time::Duration};
+use stylish::Write;
 use tracing_subscriber::EnvFilter;
 
 const USER_AGENT: &str = concat!("cargo-dl/", env!("CARGO_PKG_VERSION"));
@@ -39,6 +41,10 @@ struct App {
     /// file or directory path. (Only when downloading a single crate).
     #[arg(short, long)]
     output: Option<String>,
+
+    /// Download and configure a patch override in the current workspace.
+    #[arg(short, long)]
+    patch: bool,
 
     // TODO: Easy way to download latest pre-release
     /// The crate(s) to download.
@@ -85,22 +91,45 @@ impl App {
             fehler::throw!(anyhow!("cannot use --output with multiple crates"));
         }
 
-        let spinner_style = Box::leak(Box::new(
+        let spinner_style = &*Box::leak(Box::new(
             indicatif::ProgressStyle::default_bar()
                 .template("{prefix:>40.cyan} {spinner} {msg}")?,
         ));
-        let success_style = Box::leak(Box::new(
+        let success_style = &*Box::leak(Box::new(
             indicatif::ProgressStyle::default_bar()
                 .template("{prefix:>40.green} {spinner} {msg}")?,
         ));
-        let failure_style = Box::leak(Box::new(
+        let failure_style = &*Box::leak(Box::new(
             indicatif::ProgressStyle::default_bar().template("{prefix:>40.red} {spinner} {msg}")?,
         ));
-        let download_style = Box::leak(Box::new(indicatif::ProgressStyle::default_bar().template("{prefix:>40.cyan} {spinner} {msg}
+        let download_style = &*Box::leak(Box::new(indicatif::ProgressStyle::default_bar().template("{prefix:>40.cyan} {spinner} {msg}
                                    [{bar:27}] {bytes:>9}/{total_bytes:9}  {bytes_per_sec} {elapsed:>4}/{eta:4}")?));
 
         let bars: &indicatif::MultiProgress = Box::leak(Box::new(indicatif::MultiProgress::new()));
-        let thread = std::thread::spawn(move || {
+        let patches = &*Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
+
+        let metadata = &*Box::leak(Box::new(
+            self.patch
+                .then(|| -> anyhow::Result<_> {
+                    let bar = bars
+                        .add(indicatif::ProgressBar::new_spinner())
+                        .with_style(spinner_style.clone())
+                        .with_prefix("workspace metadata")
+                        .with_message("parsing");
+                    bar.enable_steady_tick(Duration::from_millis(100));
+
+                    let metadata = MetadataCommand::new().exec()?;
+                    self.slow();
+
+                    bar.set_style(success_style.clone());
+                    bar.finish_with_message("parsed");
+
+                    Ok(metadata)
+                })
+                .transpose()?,
+        ));
+
+        let thread = std::thread::spawn(move || -> anyhow::Result<_> {
             let mut index = crates_index::Index::new_cargo_default()?;
             if self.update_index {
                 let bar = bars
@@ -118,13 +147,44 @@ impl App {
 
             let threads = Vec::from_iter(self.specs.iter().map(|spec| {
                 let bar = bars.add(indicatif::ProgressBar::new_spinner()).with_style(spinner_style.clone());
-                (spec, std::thread::spawn(|| {
+                (spec, std::thread::spawn(|| -> anyhow::Result<()> {
                     let bar = bar;
                     bar.tick();
                     bar.set_prefix(spec.to_string());
-                    let index = crates_index::Index::new_cargo_default()?;
+
                     bar.set_message("selecting version");
                     bar.enable_steady_tick(Duration::from_millis(100));
+
+                    let version_request = if self.patch {
+                        let version = spec.version_req_str.as_deref().map(semver::Version::parse).transpose()?;
+                        let mut packages: Vec<_> = metadata.as_ref().unwrap().packages.iter()
+                            .filter(|p| p.name == spec.name.0 && version.as_ref().map(|v| &p.version == v).unwrap_or(true))
+                            .collect();
+                        match &mut packages[..] {
+                            [package] => semver::VersionReq {
+                                comparators: vec![semver::Comparator {
+                                    op: semver::Op::Exact,
+                                    major: package.version.major,
+                                    minor: Some(package.version.minor),
+                                    patch: Some(package.version.patch),
+                                    pre: package.version.pre.clone(),
+                                }],
+                            },
+                            packages => {
+                                let mut message = stylish::format!("there are multiple `{:(fg=magenta)}` packages in your project, disambiguate with one of these package ids:", spec.name.0);
+                                for package in packages {
+                                    let mut version = package.version.clone();
+                                    version.build = semver::BuildMetadata::EMPTY;
+                                    stylish::write!(message, "\n{:>45}{:(fg=magenta)}@{:(fg=magenta)}", "", spec.name.0, version)?;
+                                }
+                                bar.set_style(failure_style.clone());
+                                bar.finish_with_message(stylish::ansi::format!("{:s}", message));
+                                return Err(LoggedError.into());
+                            }
+                        }
+                    } else { spec.version_req.clone().unwrap_or(semver::VersionReq::STAR) };
+
+                    let index = crates_index::Index::new_cargo_default()?;
                     self.slow();
                     // TODO: fuzzy name matching https://github.com/frewsxcv/rust-crates-index/issues/75
                     let krate = match index.crate_(&spec.name.0) {
@@ -141,7 +201,6 @@ impl App {
                         Vec::from_iter(krate.versions().iter().map(|v| v.version()))
                     );
 
-                    let version_request = spec.version_req.clone().unwrap_or(semver::VersionReq::STAR);
                     let versions = {
                         let mut versions: Vec<_> = krate
                             .versions()
@@ -204,7 +263,7 @@ impl App {
 
                     let version_str = stylish::format!("{:(fg=magenta)} {:(fg=magenta)}", version.name(), version.version());
 
-                    let output = self.output.clone().unwrap_or_else(|| if self.extract {
+                    let output = self.output.clone().unwrap_or_else(|| if self.extract || self.patch {
                         format!("{}-{}", version.name(), version.version())
                     } else {
                         format!("{}-{}.crate", version.name(), version.version())
@@ -221,7 +280,7 @@ impl App {
                     match cached {
                         Ok(path) => {
                             tracing::debug!("found cached crate for {} {} at {}", version.name(), version.version(), path.display());
-                            if self.extract {
+                            if self.extract || self.patch {
                                 bar.set_message(stylish::ansi::format!("extracting {:s} to {:(fg=blue)}", version_str, output));
                                 let file = std::fs::File::open(path)?;
                                 bar.reset();
@@ -270,7 +329,7 @@ impl App {
                             tracing::debug!("verified checksum ({})", hex::encode(version.checksum()));
                             self.slow();
 
-                            if self.extract {
+                            if self.extract || self.patch {
                                 bar.set_message(stylish::ansi::format!("extracting {:s} to {:(fg=blue)}", version_str, output));
                                 bar.reset();
                                 bar.set_length(u64::try_from(data.len())?);
@@ -289,10 +348,13 @@ impl App {
                             }
                         }
                     }
-                    Result::<(), anyhow::Error>::Ok(())
+
+                    patches.lock().unwrap().push((version.name().to_owned(), version.version().to_owned(), output));
+
+                    Ok(())
                 }))
             }));
-            Result::<_, anyhow::Error>::Ok(threads)
+            Ok(threads)
         });
         let mut logged_error = false;
         match thread.join() {
@@ -315,6 +377,41 @@ impl App {
         }
         if logged_error {
             fehler::throw!(LoggedError);
+        }
+
+        if self.patch {
+            use toml_edit::{value, Document, Item, Table};
+
+            let bar = bars
+                .add(indicatif::ProgressBar::new_spinner())
+                .with_style(spinner_style.clone())
+                .with_prefix("Cargo.toml")
+                .with_message("patching");
+            bar.enable_steady_tick(Duration::from_millis(100));
+
+            let metadata = metadata.as_ref().unwrap();
+            let file = metadata.workspace_root.join("Cargo.toml");
+            let mut document = std::fs::read_to_string(&file)?.parse::<Document>()?;
+            let patch = &mut document["patch"];
+            if patch.is_none() {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                patch.or_insert(Item::Table(table));
+            }
+            let table = patch["crates-io"].or_insert(Item::Table(Table::new()));
+            for (name, _, path) in &patches.lock().unwrap()[..] {
+                let path = std::env::current_dir()?
+                    .join(path)
+                    .strip_prefix(&metadata.workspace_root)?
+                    .to_owned();
+                table[name]["path"] = value(path.to_str().context("non-utf8 path")?);
+            }
+            std::fs::write(&file, document.to_string())?;
+
+            self.slow();
+
+            bar.set_style(success_style.clone());
+            bar.finish_with_message("patched");
         }
     }
 }

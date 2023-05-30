@@ -4,6 +4,8 @@ use crate::{crate_name, CrateName};
 pub(crate) struct PackageIdSpec {
     pub(crate) name: CrateName,
     pub(crate) version_req: Option<semver::VersionReq>,
+    /// Should be `version_req.to_string()`, but that re-encodes `1.0` as `^1.0`
+    pub(crate) version_req_str: Option<String>,
 }
 
 #[derive(thiserror::Error, Debug, displaydoc::Display)]
@@ -31,11 +33,13 @@ impl std::str::FromStr for PackageIdSpec {
                     v.parse()
                         .map_err(|e| ParseError::VersionReq(e, v.to_owned()))?,
                 ),
+                version_req_str: Some(v.to_owned()),
             }
         } else {
             Self {
                 name: parse_crate_name(s)?,
                 version_req: None,
+                version_req_str: None,
             }
         }
     }
@@ -46,7 +50,8 @@ impl std::fmt::Display for PackageIdSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) {
         if let PackageIdSpec {
             name,
-            version_req: Some(version_req),
+            version_req_str: Some(version_req),
+            ..
         } = self
         {
             f.pad(&format!("{name}@{version_req}"))?;
